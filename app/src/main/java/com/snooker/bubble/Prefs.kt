@@ -42,6 +42,13 @@ object Prefs {
         e.apply()
     }
 
+    /** إظهار خط اتجاه الكرة لحد الجيب */
+    fun showLine(ctx: Context): Boolean = sp(ctx).getBoolean("line", true)
+
+    fun setShowLine(ctx: Context, v: Boolean) {
+        sp(ctx).edit().putBoolean("line", v).apply()
+    }
+
     /** هامش الخطأ المسموح بالدرجات */
     fun tolerance(ctx: Context): Int = sp(ctx).getInt("tol", 3)
 

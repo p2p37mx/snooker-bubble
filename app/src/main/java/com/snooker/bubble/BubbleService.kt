@@ -66,6 +66,7 @@ class BubbleService : Service() {
     private lateinit var bg: Handler
 
     private var bubble: BubbleView? = null
+    private var pathView: PathView? = null
     private var bubbleParams: WindowManager.LayoutParams? = null
     private var calib: CalibrationView? = null
 
@@ -399,6 +400,7 @@ class BubbleService : Service() {
             if (cal == null) {
                 analyzer.debug.reason = "منظر 3D - حوّل للمنظر الفوقي"
                 show(BubbleView.Mode.VIEW, 0f)
+                main.post { pathView?.clear() }
                 return
             }
             val sx = w.toFloat() / scrW
@@ -426,6 +428,21 @@ class BubbleService : Service() {
                 else -> BubbleView.Mode.IDLE
             }
             show(mode, res.errDeg)
+
+            val dbg = analyzer.debug
+            if (Prefs.showLine(this) && dbg.hasObj && dbg.hasPath &&
+                (mode == BubbleView.Mode.GOOD || mode == BubbleView.Mode.BAD)
+            ) {
+                val kx = scrW.toFloat() / w
+                val ky = scrH.toFloat() / h
+                val ax = dbg.ox * kx; val ay = dbg.oy * ky
+                val bx = dbg.px * kx; val by = dbg.py * ky
+                val gap = dbg.orad * kx * 2.6f
+                val good = mode == BubbleView.Mode.GOOD
+                main.post { if (!paused && !calibrating) pathView?.set(ax, ay, bx, by, gap, good) }
+            } else {
+                main.post { pathView?.clear() }
+            }
         } catch (ignored: Exception) {
         } finally {
             img.close()
@@ -532,8 +549,34 @@ class BubbleService : Service() {
     // ---------------- الفقاعة ----------------
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
+    private fun showPathOverlay() {
+        val v = PathView(this)
+        val p = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        )
+        // لازم <= 0.8 حتى اللمس يعبر للعبة (أندرويد 12+)
+        p.alpha = 0.8f
+        p.gravity = Gravity.TOP or Gravity.START
+        if (Build.VERSION.SDK_INT >= 28) {
+            p.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+        try {
+            wm.addView(v, p)
+            pathView = v
+        } catch (ignored: Exception) { }
+    }
+
     @SuppressLint("ClickableViewAccessibility")
     private fun showBubble() {
+        showPathOverlay()
         val size = dp(60)
         val v = BubbleView(this)
         val p = WindowManager.LayoutParams(
@@ -582,6 +625,7 @@ class BubbleService : Service() {
         paused = !paused
         bg.post { history.clear() }
         bubble?.set(if (paused) BubbleView.Mode.PAUSED else idleMode(), 0f)
+        pathView?.clear()
         Toast.makeText(this, if (paused) "إيقاف مؤقت" else "رجع يشتغل", Toast.LENGTH_SHORT).show()
     }
 
@@ -652,6 +696,7 @@ class BubbleService : Service() {
     private fun startCalibration() {
         if (calib != null) return
         calibrating = true
+        pathView?.clear()
         val v = CalibrationView(
             this,
             onDone = { pts -> finishCalibration(pts) },
@@ -727,6 +772,8 @@ class BubbleService : Service() {
         main.removeCallbacksAndMessages(null)
         bubble?.let { try { wm.removeView(it) } catch (ignored: Exception) { } }
         bubble = null
+        pathView?.let { try { wm.removeView(it) } catch (ignored: Exception) { } }
+        pathView = null
         calib?.let { try { wm.removeView(it) } catch (ignored: Exception) { } }
         calib = null
 

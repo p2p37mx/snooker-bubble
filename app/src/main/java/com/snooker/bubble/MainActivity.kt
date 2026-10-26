@@ -73,6 +73,15 @@ class MainActivity : Activity() {
             refresh()
         }, lp(top = 10))
 
+        // خط الاتجاه
+        root.addView(android.widget.CheckBox(this).apply {
+            text = "إظهار خط اتجاه الكرة لحد الجيب"
+            textSize = 15f
+            setTextColor(0xFF111827.toInt())
+            isChecked = Prefs.showLine(this@MainActivity)
+            setOnCheckedChangeListener { _, c -> Prefs.setShowLine(this@MainActivity, c) }
+        }, lp(top = 16))
+
         // دقة الحكم
         val tolLabel = TextView(this).apply {
             textSize = 15f
@@ -110,6 +119,7 @@ class MainActivity : Activity() {
                 • حوّل اللعبة للمنظر الفوقي (أيقونة الكاميرا يسار الشاشة).
                 • ما تحتاج معايرة: المساعد يلگه الطاولة والجيوب وحده.
                 • صوّب: 🟢 = الكرة داخلة جيب، 🔴 = مو داخلة (الرقم = كم درجة مغلّط).
+                • خط الاتجاه يطلع من الكرة الملونة: أخضر لحد الجيب، أحمر لحد الحافة. تگدر تطفيه من فوق.
                 • 🔵 = أنت بمنظر 3D، حوّل للفوقي.
                 • ضغطة وحدة = إيقاف مؤقت / تشغيل.
                 • ضغطتين بسرعة = لقطة تشخيص تنحفظ بالصور (مجلد SnookerBubble) — دزها إذا شي ما ضبط.

@@ -465,14 +465,10 @@ class Analyzer {
         if (ul < 1e-6f) return fail("خطأ بالحساب")
         ux /= ul; uy /= ul
 
-        if (apply(Hi, otx + ux * 0.8f, oty + uy * 0.8f, tmp)) {
-            debug.hasPath = true
-            debug.px = tmp[0]; debug.py = tmp[1]
-        }
-
         // ---------- 6) هل تدخل بجيب؟ ----------
         var bestErr = 999f
-        for (p in POCKETS) {
+        var bestK = -1
+        for ((k, p) in POCKETS.withIndex()) {
             val pxv = p[0] - otx
             val pyv = p[1] - oty
             val dist = hypot(pxv, pyv)
@@ -482,9 +478,28 @@ class Analyzer {
             val ang = Math.toDegrees(acos(c.coerceIn(-1f, 1f)).toDouble()).toFloat()
             val allow = Math.toDegrees(atan(0.028f / dist).toDouble()).toFloat()
             val err = max(0f, ang - allow)
-            if (err < bestErr) bestErr = err
+            if (err < bestErr) { bestErr = err; bestK = k }
         }
         val st = if (bestErr <= tolDeg) State.GOOD else State.BAD
+
+        // نهاية خط الاتجاه: الجيب إذا داخلة، وإلا حافة الطاولة
+        var endU: Float
+        var endV: Float
+        if (st == State.GOOD && bestK >= 0) {
+            endU = POCKETS[bestK][0]; endV = POCKETS[bestK][1]
+        } else {
+            var tEnd = 3f
+            if (ux > 1e-6f) tEnd = min(tEnd, (1f - otx) / ux)
+            if (ux < -1e-6f) tEnd = min(tEnd, (0f - otx) / ux)
+            if (uy > 1e-6f) tEnd = min(tEnd, (2f - oty) / uy)
+            if (uy < -1e-6f) tEnd = min(tEnd, (0f - oty) / uy)
+            tEnd = max(0f, tEnd)
+            endU = otx + ux * tEnd; endV = oty + uy * tEnd
+        }
+        if (apply(Hi, endU, endV, tmp)) {
+            debug.hasPath = true
+            debug.px = tmp[0]; debug.py = tmp[1]
+        }
         val e = if (bestErr >= 999f) 99f else bestErr
         debug.state = st
         debug.errDeg = e
