@@ -109,6 +109,7 @@ class Analyzer {
 
     // لون القماش
     private var feltHue = 120f
+    private var feltMinRB = 40
     private var frame = 0
 
     // منطقة الطاولة (مخزنة)
@@ -228,14 +229,17 @@ class Analyzer {
                     } else if (rg == 2) {
                         m = 0
                     } else {
-                        var felt = false
+                        // 3 = قماش ، 0 = ضوء خط التصويب (أخضر فاتح) ، 2 = كرة
                         val ch = mx - mn
-                        if (mx >= 50 && ch > 0.3f * mx) {
-                            var dh = abs(hue(r, g, b, mx, ch) - feltHue)
+                        var dh = 180f
+                        if (ch > 0) {
+                            dh = abs(hue(r, g, b, mx, ch) - feltHue)
                             if (dh > 180f) dh = 360f - dh
-                            felt = dh < 22f
                         }
-                        m = if (felt) 3 else 2
+                        m = if (mx >= 50 && ch > 0.3f * mx && dh < 22f) 3
+                        else if (mx < 45) 2
+                        else if (dh < 35f) 0
+                        else 2
                     }
                 }
                 mask[y * tw + x] = m.toByte()
@@ -354,15 +358,19 @@ class Analyzer {
         while (true) {
             val x = cx + dirX * t
             val y = cy + dirY * t
-            if (x < 4 || y < 4 || x >= tw - 4 || y >= th - 4) break
+            if (x < 8 || y < 8 || x >= tw - 8 || y >= th - 8) break
             if (t > rad * 2f && count(x, y, 2) >= 5) { hitBall = t; break }
             var fx = -1
             var fy = -1
-            for (o in OFFSETS) {
+            var bestL = 22
+            var bestO = 99
+            for (o in -4..4) {
                 val xx = Math.round(x - dirY * o)
                 val yy = Math.round(y + dirX * o)
-                if (xx in 0 until tw && yy in 0 until th && mask[yy * tw + xx].toInt() == 1) {
-                    fx = xx; fy = yy; break
+                if (xx !in 0 until tw || yy !in 0 until th) continue
+                val l = lightness(px, w, x0, y0, xx, yy)
+                if (l > bestL || (l == bestL && fx >= 0 && abs(o) < abs(bestO))) {
+                    bestL = l; bestO = o; fx = xx; fy = yy
                 }
             }
             if (fx >= 0) {
@@ -372,7 +380,13 @@ class Analyzer {
                     val ddx = fx - cx
                     val ddy = fy - cy
                     val l = hypot(ddx, ddy)
-                    if (l > 0f) { dirX = ddx / l; dirY = ddy / l }
+                    if (l > 0f) {
+                        var nx = 0.7f * dirX + 0.3f * (ddx / l)
+                        var ny = 0.7f * dirY + 0.3f * (ddy / l)
+                        val nl = hypot(nx, ny)
+                        nx /= nl; ny /= nl
+                        dirX = nx; dirY = ny
+                    }
                 }
             } else if (lastWhite > 0 && t - lastWhite > maxGap) {
                 break
@@ -418,6 +432,7 @@ class Analyzer {
         val ox = osx / oc
         val oy = osy / oc
         val orad = sqrt(oc / Math.PI.toFloat()).coerceIn(rad * 0.4f, rad * 1.3f)
+        if (notBallRing(ox, oy, rad * 1.7f) < 24) return fail("ما لگيت الكرة الملونة")
         debug.hasObj = true
         debug.ox = ox + x0; debug.oy = oy + y0; debug.orad = orad
 
@@ -508,6 +523,29 @@ class Analyzer {
     }
 
     private var peakSum = 0f
+
+    /** قد شكد البكسل أفتح من القماش (للخط الأبيض والضوء الأخضر الفاتح حوله) */
+    private fun lightness(px: IntArray, w: Int, x0: Int, y0: Int, x: Int, y: Int): Int {
+        if (mask[y * tw + x].toInt() == 1) return 255
+        val c = px[(y + y0) * w + x + x0]
+        val r = (c shr 16) and 0xff
+        val g = (c shr 8) and 0xff
+        val b = c and 0xff
+        if (g < r || g < b) return -1
+        return min(r, b) - feltMinRB
+    }
+
+    /** كم نقطة حول الكرة مو "كرة" - الكرة الحقيقية محاطة بقماش، شريط اللعبة لا */
+    private fun notBallRing(cx: Float, cy: Float, r: Float): Int {
+        var n = 0
+        for (i in 0 until 32) {
+            val a = i * Math.PI / 16.0
+            val x = (cx + r * cos(a)).toInt()
+            val y = (cy + r * sin(a)).toInt()
+            if (x in 0 until tw && y in 0 until th && mask[y * tw + x].toInt() != 2) n++
+        }
+        return n
+    }
 
     private fun aimHistogram(cx: Float, cy: Float, rad: Float): Int {
         java.util.Arrays.fill(hist, 0f)
@@ -645,6 +683,7 @@ class Analyzer {
             val mx = max(r, max(g, b))
             val mn = min(r, min(g, b))
             if (mx > mn) feltHue = hue(r, g, b, mx, mx - mn)
+            feltMinRB = min(r, b)
         }
     }
 }
