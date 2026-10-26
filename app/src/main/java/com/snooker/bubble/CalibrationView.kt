@@ -12,7 +12,7 @@ import android.view.View
 import kotlin.math.hypot
 
 /**
- * شاشة شفافة فوق اللعبة: المستخدم يضغط على الجيوب الستة.
+ * شاشة شفافة فوق اللعبة: المستخدم يضغط على 4 جيوب بالترتيب.
  * الضغط على نقطة موجودة يحذفها. التعليمات بنص الشاشة (ما بيها جيوب).
  */
 class CalibrationView(
@@ -20,6 +20,15 @@ class CalibrationView(
     private val onDone: (List<FloatArray>) -> Unit,
     private val onCancel: () -> Unit
 ) : View(context) {
+
+    companion object {
+        val STEPS = arrayOf(
+            "جيب زاوية بطرف الطاولة (مثلاً فوق يسار)",
+            "جيب الزاوية الثاني بنفس الطرف (جوه يسار)",
+            "الجيب الوسطي اللي بجهة نقطة 1",
+            "الجيب الوسطي اللي بجهة نقطة 2"
+        )
+    }
 
     private val raw = mutableListOf<FloatArray>()
     private val local = mutableListOf<FloatArray>()
@@ -47,9 +56,11 @@ class CalibrationView(
         val cx = width / 2f
         val cy = height / 2f
 
-        infoRect.set(cx - 150 * d, cy - 46 * d, cx + 150 * d, cy + 4 * d)
+        infoRect.set(cx - 165 * d, cy - 64 * d, cx + 165 * d, cy + 4 * d)
         canvas.drawRoundRect(infoRect, 12 * d, 12 * d, boxBg)
-        canvas.drawText("اضغط على الجيوب الستة (${raw.size}/6)", cx, cy - 24 * d, txt)
+        val step = raw.size.coerceAtMost(3)
+        canvas.drawText("نقطة ${step + 1} من 4", cx, cy - 42 * d, txt)
+        canvas.drawText(STEPS[step], cx, cy - 22 * d, small)
         canvas.drawText("ضغطة على نقطة موجودة = حذفها", cx, cy - 6 * d, small)
 
         cancelRect.set(cx - 45 * d, cy + 12 * d, cx + 45 * d, cy + 46 * d)
@@ -79,7 +90,7 @@ class CalibrationView(
         local.add(floatArrayOf(e.x, e.y))
         raw.add(floatArrayOf(e.rawX, e.rawY))
         invalidate()
-        if (raw.size == 6) {
+        if (raw.size == 4) {
             done = true
             postDelayed({ onDone(raw.toList()) }, 350)
         }

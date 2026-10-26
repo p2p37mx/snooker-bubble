@@ -12,28 +12,114 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * يحلل صورة مصغّرة من الشاشة:
- * 1) يلگه الكرة البيضة (أكبر دائرة بيضة على الطاولة).
- * 2) يلگه خط التصويب الأبيض اللي ترسمه اللعبة ويحسب اتجاهه.
- * 3) يلگه الكرة الملونة اللي راح تنضرب.
- * 4) يحسب وين راح تروح الكرة الملونة بعد الضربة ويشوف هل تدخل بأي جيب.
+ * يحلل صورة الشاشة:
+ * - الطاولة معرّفة بـ 4 جيوب (زاويتين بعيدتين + جيبين وسطيين) => homography
+ *   تحوّل الشاشة (حتى لو 3D) لإحداثيات طاولة حقيقية: العرض = 1 ، الطول = 2.
+ * - الكرة البيضة = دائرة بيضة محاطة بالقماش، يطلع منها خط التصويب.
+ * - نمشي على خط التصويب لحد الكرة الملونة.
+ * - نحسب نقطة الاصطدام بحجم الكرة الحقيقي، ونشوف اتجاه الكرة الملونة يدخل جيب لو لا.
  */
 class Analyzer {
 
     enum class State { NONE, GOOD, BAD }
 
-    class Result(val state: State, val errDeg: Float)
+    class Result(val state: State, val errDeg: Float, val reason: String)
 
-    private val none = Result(State.NONE, 0f)
+    /** معلومات التشخيص لآخر إطار (بإحداثيات الصورة) */
+    class Debug {
+        var hasCue = false
+        var cx = 0f; var cy = 0f; var rad = 0f
+        var hasLine = false
+        var ex = 0f; var ey = 0f
+        var hasObj = false
+        var ox = 0f; var oy = 0f; var orad = 0f
+        var hasPath = false
+        var px = 0f; var py = 0f
+        var reason = ""
+        var errDeg = 0f
+        var state = State.NONE
+    }
 
-    // لون القماش (يتحدث تلقائياً)
-    private var feltR = 20
-    private var feltG = 110
-    private var feltB = 60
+    val debug = Debug()
+
+    companion object {
+        const val BALL_R = 0.0148f
+        private val OFFSETS = intArrayOf(0, 1, -1, 2, -2, 3, -3)
+
+        val POCKETS = arrayOf(
+            floatArrayOf(0f, 0f), floatArrayOf(1f, 0f),
+            floatArrayOf(0f, 1f), floatArrayOf(1f, 1f),
+            floatArrayOf(0f, 2f), floatArrayOf(1f, 2f)
+        )
+
+        /** ترتيب نقاط المعايرة: زاوية1 ، زاوية2 (نفس الطرف) ، وسطي بجهة1 ، وسطي بجهة2 */
+        val CAL_TABLE = arrayOf(
+            floatArrayOf(0f, 0f), floatArrayOf(1f, 0f),
+            floatArrayOf(0f, 1f), floatArrayOf(1f, 1f)
+        )
+
+        fun homography(src: Array<FloatArray>, dst: Array<FloatArray>): DoubleArray? {
+            val a = Array(8) { DoubleArray(9) }
+            for (i in 0 until 4) {
+                val x = src[i][0].toDouble(); val y = src[i][1].toDouble()
+                val u = dst[i][0].toDouble(); val v = dst[i][1].toDouble()
+                a[2 * i] = doubleArrayOf(x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y, u)
+                a[2 * i + 1] = doubleArrayOf(0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y, v)
+            }
+            for (col in 0 until 8) {
+                var piv = col
+                for (r in col + 1 until 8) if (abs(a[r][col]) > abs(a[piv][col])) piv = r
+                if (abs(a[piv][col]) < 1e-12) return null
+                val tmp = a[col]; a[col] = a[piv]; a[piv] = tmp
+                for (r in 0 until 8) {
+                    if (r == col) continue
+                    val f = a[r][col] / a[col][col]
+                    if (f == 0.0) continue
+                    for (c in col until 9) a[r][c] -= f * a[col][c]
+                }
+            }
+            val h = DoubleArray(9)
+            for (i in 0 until 8) h[i] = a[i][8] / a[i][i]
+            h[8] = 1.0
+            return h
+        }
+
+        fun invert(m: DoubleArray): DoubleArray? {
+            val a = m[0]; val b = m[1]; val c = m[2]
+            val d = m[3]; val e = m[4]; val f = m[5]
+            val g = m[6]; val h = m[7]; val i = m[8]
+            val det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+            if (abs(det) < 1e-18) return null
+            val k = 1.0 / det
+            return doubleArrayOf(
+                (e * i - f * h) * k, (c * h - b * i) * k, (b * f - c * e) * k,
+                (f * g - d * i) * k, (a * i - c * g) * k, (c * d - a * f) * k,
+                (d * h - e * g) * k, (b * g - a * h) * k, (a * e - b * d) * k
+            )
+        }
+
+        fun apply(m: DoubleArray, x: Float, y: Float, out: FloatArray): Boolean {
+            val w = m[6] * x + m[7] * y + m[8]
+            if (abs(w) < 1e-12) return false
+            out[0] = ((m[0] * x + m[1] * y + m[2]) / w).toFloat()
+            out[1] = ((m[3] * x + m[4] * y + m[5]) / w).toFloat()
+            return true
+        }
+    }
+
+    // لون القماش
+    private var feltHue = 120f
     private var frame = 0
 
-    // 0 = قماش/خلفية ، 1 = أبيض ، 2 = كرة/جسم ملون
-    private var mask = ByteArray(0)
+    // منطقة الطاولة (مخزنة)
+    private var region = ByteArray(0)      // 0 خارج ، 1 داخل ، 2 داخل قرب جيب
+    private var regionH: DoubleArray? = null
+    private var regionW = 0
+    private var regionHt = 0
+    private var rx0 = 0; private var ry0 = 0; private var rx1 = -1; private var ry1 = -1
+
+    // صور العمل (بإحداثيات محلية داخل حدود الطاولة)
+    private var mask = ByteArray(0)        // 0 لا شي ، 1 أبيض ، 2 كرة/جسم ، 3 قماش
     private var whiteI = IntArray(0)
     private var ballI = IntArray(0)
     private val hist = FloatArray(360)
@@ -45,29 +131,68 @@ class Analyzer {
     private var tw = 0
     private var th = 0
     private var w1 = 0
+    private val tmp = FloatArray(2)
+    private val tmp2 = FloatArray(2)
+    private val tmp3 = FloatArray(2)
+
+    private fun fail(reason: String): Result {
+        debug.reason = reason
+        debug.state = State.NONE
+        return Result(State.NONE, 0f, reason)
+    }
+
+    private fun buildRegion(H: DoubleArray, w: Int, h: Int, refX: Float, refY: Float) {
+        if (region.size < w * h) region = ByteArray(w * h)
+        val refSign = H[6] * refX + H[7] * refY + H[8] > 0
+        rx0 = w; ry0 = h; rx1 = -1; ry1 = -1
+        val pr2 = 0.05f * 0.05f
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val ww = H[6] * x + H[7] * y + H[8]
+                var r = 0
+                if (ww != 0.0 && (ww > 0) == refSign) {
+                    val u = ((H[0] * x + H[1] * y + H[2]) / ww).toFloat()
+                    val v = ((H[3] * x + H[4] * y + H[5]) / ww).toFloat()
+                    if (u > 0.012f && u < 0.988f && v > 0.012f && v < 1.988f) {
+                        r = 1
+                        for (p in POCKETS) {
+                            val du = u - p[0]; val dv = v - p[1]
+                            if (du * du + dv * dv < pr2) { r = 2; break }
+                        }
+                    }
+                }
+                region[y * w + x] = r.toByte()
+                if (r != 0) {
+                    if (x < rx0) rx0 = x
+                    if (x > rx1) rx1 = x
+                    if (y < ry0) ry0 = y
+                    if (y > ry1) ry1 = y
+                }
+            }
+        }
+        regionH = H.copyOf()
+        regionW = w
+        regionHt = h
+    }
 
     fun analyze(
         px: IntArray, w: Int, h: Int,
-        pockets: Array<FloatArray>,
-        excl: IntArray?,
-        tolDeg: Float
+        H: DoubleArray, Hi: DoubleArray,
+        refX: Float, refY: Float,
+        excl: IntArray?, tolDeg: Float
     ): Result {
-        // حدود الطاولة من الجيوب
-        var minX = Float.MAX_VALUE
-        var minY = Float.MAX_VALUE
-        var maxX = -1f
-        var maxY = -1f
-        for (p in pockets) {
-            minX = min(minX, p[0]); minY = min(minY, p[1])
-            maxX = max(maxX, p[0]); maxY = max(maxY, p[1])
+        debug.hasCue = false; debug.hasLine = false; debug.hasObj = false; debug.hasPath = false
+
+        val rh = regionH
+        if (rh == null || regionW != w || regionHt != h || !rh.contentEquals(H)) {
+            buildRegion(H, w, h, refX, refY)
+            frame = 0
         }
-        val x0 = max(0, minX.toInt())
-        val y0 = max(0, minY.toInt())
-        val x1 = min(w - 1, maxX.toInt())
-        val y1 = min(h - 1, maxY.toInt())
-        tw = x1 - x0 + 1
-        th = y1 - y0 + 1
-        if (tw < 60 || th < 30) return none
+        if (rx1 < rx0 || ry1 < ry0) return fail("الطاولة خارج الشاشة - عيد المعايرة")
+        val x0 = rx0; val y0 = ry0
+        tw = rx1 - rx0 + 1
+        th = ry1 - ry0 + 1
+        if (tw < 60 || th < 30) return fail("الطاولة صغيرة - عيد المعايرة")
         w1 = tw + 1
 
         if (frame % 25 == 0) estimateFelt(px, w, x0, y0)
@@ -81,47 +206,36 @@ class Analyzer {
             ballI = IntArray(ni)
         }
 
-        val longSide = max(tw, th).toFloat()
-        val band = max(2, (longSide / 90f).toInt())
-        val pocketR = longSide / 38f
-        val pr2 = pocketR * pocketR
-        val pkx = FloatArray(pockets.size) { pockets[it][0] - x0 }
-        val pky = FloatArray(pockets.size) { pockets[it][1] - y0 }
-
         // ---------- تصنيف البكسلات ----------
         for (y in 0 until th) {
-            val row = (y0 + y) * w + x0
             val gy = y + y0
+            val row = gy * w
             for (x in 0 until tw) {
-                var m = 0
                 val gx = x + x0
+                val rg = region[row + gx].toInt()
+                var m = 0
                 val inExcl = excl != null &&
                         gx >= excl[0] && gx <= excl[2] && gy >= excl[1] && gy <= excl[3]
-                if (!inExcl) {
-                    val c = px[row + x]
+                if (rg != 0 && !inExcl) {
+                    val c = px[row + gx]
                     val r = (c shr 16) and 0xff
                     val g = (c shr 8) and 0xff
                     val b = c and 0xff
                     val mn = min(r, min(g, b))
                     val mx = max(r, max(g, b))
-                    if (mn >= 175 && mx - mn <= 55) {
+                    if (mn >= 140 && mx - mn <= 70 && r - g <= 35) {
                         m = 1
+                    } else if (rg == 2) {
+                        m = 0
                     } else {
-                        val dr = r - feltR
-                        val dg = g - feltG
-                        val db = b - feltB
-                        if (dr * dr + dg * dg + db * db > 4900) {
-                            m = 2
-                            if (x < band || y < band || x >= tw - band || y >= th - band) {
-                                m = 0
-                            } else {
-                                for (k in pkx.indices) {
-                                    val ddx = x - pkx[k]
-                                    val ddy = y - pky[k]
-                                    if (ddx * ddx + ddy * ddy < pr2) { m = 0; break }
-                                }
-                            }
+                        var felt = false
+                        val ch = mx - mn
+                        if (mx >= 50 && ch > 0.3f * mx) {
+                            var dh = abs(hue(r, g, b, mx, ch) - feltHue)
+                            if (dh > 180f) dh = 360f - dh
+                            felt = dh < 22f
                         }
+                        m = if (felt) 3 else 2
                     }
                 }
                 mask[y * tw + x] = m.toByte()
@@ -129,79 +243,87 @@ class Analyzer {
         }
         buildIntegrals()
 
-        // ---------- 1) الكرة البيضة ----------
-        val dMax = max(6, (longSide / 28f).toInt())
-        val dMin = max(4, (longSide / 90f).toInt())
-        var cx = -1f
-        var cy = -1f
-        var rad = 0f
+        // ---------- 1) مرشحين للكرة البيضة ----------
+        val dMax = max(8, w / 35)
+        val dMin = max(5, w / 130)
+        val candX = FloatArray(12)
+        val candY = FloatArray(12)
+        val candR = FloatArray(12)
+        var nc = 0
         var d = dMax
-        while (d >= dMin) {
-            if (d >= tw || d >= th) { d--; continue }
-            val need = (0.62f * d * d).toInt()
+        outer@ while (d >= dMin) {
+            if (d * 2 >= tw || d * 2 >= th) { d--; continue }
+            val need = (0.55f * d * d).toInt()
             val step = max(1, d / 4)
-            var best = -1
-            var bx = 0
-            var by = 0
+            val bx = (1.4f * d).toInt()
+            val q = max(1, bx / 4)
             var y = 0
             while (y + d <= th) {
                 var x = 0
                 while (x + d <= tw) {
                     val s = box(whiteI, x, y, d)
-                    if (s > best) { best = s; bx = x; by = y }
+                    if (s >= need) {
+                        val ox = x + d / 2 - bx / 2
+                        val oy = y + d / 2 - bx / 2
+                        if (ox >= 0 && oy >= 0 && ox + bx <= tw && oy + bx <= th) {
+                            val cs = box(whiteI, ox, oy, q) + box(whiteI, ox + bx - q, oy, q) +
+                                    box(whiteI, ox, oy + bx - q, q) + box(whiteI, ox + bx - q, oy + bx - q, q)
+                            if (cs <= q * q) {
+                                val ccx = x + d / 2f
+                                val ccy = y + d / 2f
+                                var overlap = false
+                                for (k in 0 until nc) {
+                                    if (hypot(ccx - candX[k], ccy - candY[k]) < max(d.toFloat(), candR[k] * 2f)) {
+                                        overlap = true; break
+                                    }
+                                }
+                                if (!overlap && feltRing(ccx, ccy, d * 0.46f * 1.8f) >= 14) {
+                                    candX[nc] = ccx; candY[nc] = ccy; candR[nc] = d * 0.46f
+                                    nc++
+                                    if (nc >= 12) break@outer
+                                }
+                            }
+                        }
+                    }
                     x += step
                 }
                 y += step
             }
-            if (best >= need) {
-                // تدقيق المكان
-                val ry0 = max(0, by - step); val ry1 = min(th - d, by + step)
-                val rx0 = max(0, bx - step); val rx1 = min(tw - d, bx + step)
-                for (yy in ry0..ry1) for (xx in rx0..rx1) {
-                    val s = box(whiteI, xx, yy, d)
-                    if (s > best) { best = s; bx = xx; by = yy }
-                }
-                var sx = 0f; var sy = 0f; var cnt = 0
-                for (yy in by until by + d) for (xx in bx until bx + d) {
-                    if (mask[yy * tw + xx].toInt() == 1) { sx += xx; sy += yy; cnt++ }
-                }
-                if (cnt > 0) {
-                    cx = sx / cnt; cy = sy / cnt
-                    rad = d * 0.46f
-                }
-                break
-            }
             d--
         }
-        if (rad <= 0f) return none
+        if (nc == 0) return fail("ما لگيت الكرة البيضة")
 
-        // ---------- 2) اتجاه خط التصويب ----------
-        java.util.Arrays.fill(hist, 0f)
-        val rIn = rad * 1.5f
-        val rOut = rad * 14f
-        val ax0 = max(0, (cx - rOut).toInt()); val ax1 = min(tw - 1, (cx + rOut).toInt())
-        val ay0 = max(0, (cy - rOut).toInt()); val ay1 = min(th - 1, (cy + rOut).toInt())
-        for (y in ay0..ay1) {
-            val row = y * tw
-            for (x in ax0..ax1) {
-                if (mask[row + x].toInt() != 1) continue
-                val dx = x - cx; val dy = y - cy
-                val dd = dx * dx + dy * dy
-                if (dd < rIn * rIn || dd > rOut * rOut) continue
-                var a = Math.toDegrees(atan2(dy, dx).toDouble()).toInt()
-                if (a < 0) a += 360
-                hist[a % 360] += 1f
+        // ---------- 2) أي مرشح يطلع منه خط تصويب ----------
+        var bestScore = -1f
+        var cx = 0f; var cy = 0f; var rad = 0f; var peak = 0
+        for (k in 0 until nc) {
+            val r0 = candR[k]
+            var sx = 0f; var sy = 0f; var cnt = 0
+            val yA = max(0, (candY[k] - r0).toInt()); val yB = min(th - 1, (candY[k] + r0).toInt())
+            val xA = max(0, (candX[k] - r0).toInt()); val xB = min(tw - 1, (candX[k] + r0).toInt())
+            for (yy in yA..yB) for (xx in xA..xB) {
+                if (mask[yy * tw + xx].toInt() == 1) { sx += xx; sy += yy; cnt++ }
+            }
+            if (cnt == 0) continue
+            val ccx = sx / cnt; val ccy = sy / cnt
+            val pk = aimHistogram(ccx, ccy, r0)
+            val score = peakSum / r0
+            if (score > bestScore) {
+                bestScore = score; cx = ccx; cy = ccy; rad = r0; peak = pk
             }
         }
-        var peak = -1
-        var peakSum = 0f
-        for (i in 0 until 360) {
-            val s = hist[(i + 359) % 360] + hist[i] + hist[(i + 1) % 360]
-            if (s > peakSum) { peakSum = s; peak = i }
-        }
-        if (peak < 0 || peakSum < max(5f, rad * 1.5f)) return none
+        if (bestScore < 0f) return fail("ما لگيت الكرة البيضة")
+        debug.hasCue = true
+        debug.cx = cx + x0; debug.cy = cy + y0; debug.rad = rad
+        if (bestScore < 3f) return fail("ما لگيت خط التصويب")
 
+        // اتجاه دقيق
+        aimHistogram(cx, cy, rad)
+        val rIn = rad * 1.5f
+        val rOut = rad * 14f
         var vx = 0f; var vy = 0f
+        val ax0 = max(0, (cx - rOut).toInt()); val ax1 = min(tw - 1, (cx + rOut).toInt())
+        val ay0 = max(0, (cy - rOut).toInt()); val ay1 = min(th - 1, (cy + rOut).toInt())
         for (y in ay0..ay1) {
             val row = y * tw
             for (x in ax0..ax1) {
@@ -220,21 +342,38 @@ class Analyzer {
             }
         }
         val theta = atan2(vy, vx)
-        val dirX = cos(theta)
-        val dirY = sin(theta)
 
-        // ---------- 3) نمشي على الخط لحد ما نوصل الكرة الملونة ----------
+        // ---------- 3) نتبع الخط (متقطع أحياناً) ----------
+        var dirX = cos(theta)
+        var dirY = sin(theta)
         var t = rad * 1.5f
         var lastWhite = -1f
         var hitBall = -1f
-        val maxGap = rad * 3f
+        var nFound = 0
+        val maxGap = max(rad * 3f, w / 20f)
         while (true) {
             val x = cx + dirX * t
             val y = cy + dirY * t
-            if (x < 1 || y < 1 || x >= tw - 1 || y >= th - 1) break
+            if (x < 4 || y < 4 || x >= tw - 4 || y >= th - 4) break
             if (t > rad * 2f && count(x, y, 2) >= 5) { hitBall = t; break }
-            if (count(x, y, 1) > 0) {
+            var fx = -1
+            var fy = -1
+            for (o in OFFSETS) {
+                val xx = Math.round(x - dirY * o)
+                val yy = Math.round(y + dirX * o)
+                if (xx in 0 until tw && yy in 0 until th && mask[yy * tw + xx].toInt() == 1) {
+                    fx = xx; fy = yy; break
+                }
+            }
+            if (fx >= 0) {
                 lastWhite = t
+                nFound++
+                if (nFound % 8 == 0 && t > rad * 6f) {
+                    val ddx = fx - cx
+                    val ddy = fy - cy
+                    val l = hypot(ddx, ddy)
+                    if (l > 0f) { dirX = ddx / l; dirY = ddy / l }
+                }
             } else if (lastWhite > 0 && t - lastWhite > maxGap) {
                 break
             } else if (lastWhite < 0 && t > rad * 4f) {
@@ -242,36 +381,32 @@ class Analyzer {
             }
             t += 1f
         }
-        val qx: Float
-        val qy: Float
-        if (hitBall > 0) {
-            qx = cx + dirX * (hitBall + rad)
-            qy = cy + dirY * (hitBall + rad)
-        } else {
-            if (lastWhite < rad * 2f) return none
-            qx = cx + dirX * lastWhite
-            qy = cy + dirY * lastWhite
-        }
+        if (lastWhite < rad * 2f) return fail("خط التصويب قصير")
+        val ex = cx + dirX * lastWhite
+        val ey = cy + dirY * lastWhite
+        debug.hasLine = true
+        debug.ex = ex + x0; debug.ey = ey + y0
 
-        // البحث عن الكرة الملونة قرب نهاية الخط
-        val bs = max(3, (rad * 1.3f).toInt())
+        // ---------- 4) الكرة الملونة قرب نهاية الخط ----------
+        val qx = if (hitBall > 0) cx + dirX * (hitBall + rad * 0.5f) else ex
+        val qy = if (hitBall > 0) cy + dirY * (hitBall + rad * 0.5f) else ey
+        val bs = max(3, rad.toInt())
         val sr = (rad * 4f).toInt()
         val sy0 = max(0, qy.toInt() - sr); val sy1 = min(th - bs, qy.toInt() + sr)
         val sx0 = max(0, qx.toInt() - sr); val sx1 = min(tw - bs, qx.toInt() + sr)
+        if (sy1 < sy0 || sx1 < sx0) return fail("ما لگيت الكرة الملونة")
         var bBest = -1
         var obx = 0
         var oby = 0
-        if (sy1 < sy0 || sx1 < sx0) return none
         for (y in sy0..sy1) for (x in sx0..sx1) {
             val s = box(ballI, x, y, bs)
             if (s > bBest) { bBest = s; obx = x; oby = y }
         }
-        if (bBest < (0.45f * bs * bs)) return none
-
+        if (bBest < (0.45f * bs * bs)) return fail("ما لگيت الكرة الملونة")
         val wcx = obx + bs / 2f
         val wcy = oby + bs / 2f
         var osx = 0f; var osy = 0f; var oc = 0
-        val rr = rad * 1.1f
+        val rr = rad * 1.3f
         val ey0 = max(0, (wcy - rr).toInt()); val ey1 = min(th - 1, (wcy + rr).toInt())
         val ex0 = max(0, (wcx - rr).toInt()); val ex1 = min(tw - 1, (wcx + rr).toInt())
         for (y in ey0..ey1) for (x in ex0..ex1) {
@@ -279,50 +414,152 @@ class Analyzer {
             val dx = x - wcx; val dy = y - wcy
             if (dx * dx + dy * dy <= rr * rr) { osx += x; osy += y; oc++ }
         }
-        if (oc == 0) return none
+        if (oc == 0) return fail("ما لگيت الكرة الملونة")
         val ox = osx / oc
         val oy = osy / oc
+        val orad = sqrt(oc / Math.PI.toFloat()).coerceIn(rad * 0.4f, rad * 1.3f)
+        debug.hasObj = true
+        debug.ox = ox + x0; debug.oy = oy + y0; debug.orad = orad
 
-        // ---------- 4) مكان الكرة البيضة لحظة الاصطدام ----------
-        val fx = cx - ox
-        val fy = cy - oy
-        val fd = fx * dirX + fy * dirY
+        // ---------- 5) الحساب على الطاولة الحقيقية ----------
+        val gOx = ox + x0
+        val gOy = oy + y0
+        // تصحيح ارتفاع الكرة بالمنظور 3D
+        if (!apply(H, gOx, gOy, tmp)) return fail("خطأ بالمعايرة")
+        val f = foreshortening(Hi, tmp[0], tmp[1])
+        val shift = orad * sqrt(max(0f, 1f - f * f))
+        if (!apply(H, gOx, gOy + shift, tmp)) return fail("خطأ بالمعايرة")
+        val otx = tmp[0]; val oty = tmp[1]
+
+        if (!apply(H, cx + dirX * 3f * rad + x0, cy + dirY * 3f * rad + y0, tmp2)) return fail("خطأ بالمعايرة")
+        if (!apply(H, ex + x0, ey + y0, tmp3)) return fail("خطأ بالمعايرة")
+        var dtx = tmp3[0] - tmp2[0]
+        var dty = tmp3[1] - tmp2[1]
+        val dl = hypot(dtx, dty)
+        if (dl < 1e-5f) return fail("خط التصويب قصير")
+        dtx /= dl; dty /= dl
+
+        val fx = tmp2[0] - otx
+        val fy = tmp2[1] - oty
+        val fd = fx * dtx + fy * dty
         val ff = fx * fx + fy * fy
-        val twoR = 2f * rad
+        val twoR = 2f * BALL_R
         val disc = fd * fd - (ff - twoR * twoR)
         val tHit: Float
         if (disc >= 0f) {
             tHit = -fd - sqrt(disc)
         } else {
-            val wide = twoR * 1.25f
-            if (fd * fd - (ff - wide * wide) < 0f) return Result(State.BAD, 99f)
+            val wide = twoR * 1.6f
+            if (fd * fd - (ff - wide * wide) < 0f) {
+                debug.reason = "الضربة ما تلمس الكرة"
+                debug.state = State.BAD; debug.errDeg = 99f
+                return Result(State.BAD, 99f, debug.reason)
+            }
             tHit = -fd
         }
-        if (tHit <= 0f) return none
-        val gx = cx + dirX * tHit
-        val gy = cy + dirY * tHit
-        var ux = ox - gx
-        var uy = oy - gy
+        val gtx = tmp2[0] + dtx * tHit
+        val gty = tmp2[1] + dty * tHit
+        var ux = otx - gtx
+        var uy = oty - gty
         val ul = hypot(ux, uy)
-        if (ul < 1e-3f) return none
+        if (ul < 1e-6f) return fail("خطأ بالحساب")
         ux /= ul; uy /= ul
 
-        // ---------- 5) هل تدخل بجيب؟ ----------
+        if (apply(Hi, otx + ux * 0.8f, oty + uy * 0.8f, tmp)) {
+            debug.hasPath = true
+            debug.px = tmp[0]; debug.py = tmp[1]
+        }
+
+        // ---------- 6) هل تدخل بجيب؟ ----------
         var bestErr = 999f
-        for (k in pkx.indices) {
-            val px2 = pkx[k] - ox
-            val py2 = pky[k] - oy
-            val dist = hypot(px2, py2)
-            if (dist < rad) continue
-            val c = (ux * px2 + uy * py2) / dist
+        for (p in POCKETS) {
+            val pxv = p[0] - otx
+            val pyv = p[1] - oty
+            val dist = hypot(pxv, pyv)
+            if (dist < BALL_R) continue
+            val c = (ux * pxv + uy * pyv) / dist
             if (c <= 0f) continue
             val ang = Math.toDegrees(acos(c.coerceIn(-1f, 1f)).toDouble()).toFloat()
-            val allow = Math.toDegrees(atan((rad * 1.0f) / dist).toDouble()).toFloat()
+            val allow = Math.toDegrees(atan(0.028f / dist).toDouble()).toFloat()
             val err = max(0f, ang - allow)
             if (err < bestErr) bestErr = err
         }
-        if (bestErr >= 999f) return Result(State.BAD, 99f)
-        return if (bestErr <= tolDeg) Result(State.GOOD, bestErr) else Result(State.BAD, bestErr)
+        val st = if (bestErr <= tolDeg) State.GOOD else State.BAD
+        val e = if (bestErr >= 999f) 99f else bestErr
+        debug.state = st
+        debug.errDeg = e
+        debug.reason = if (st == State.GOOD) "داخلة ✓" else "مو داخلة"
+        return Result(st, e, debug.reason)
+    }
+
+    private var peakSum = 0f
+
+    private fun aimHistogram(cx: Float, cy: Float, rad: Float): Int {
+        java.util.Arrays.fill(hist, 0f)
+        val rIn = rad * 1.5f
+        val rOut = rad * 14f
+        val ax0 = max(0, (cx - rOut).toInt()); val ax1 = min(tw - 1, (cx + rOut).toInt())
+        val ay0 = max(0, (cy - rOut).toInt()); val ay1 = min(th - 1, (cy + rOut).toInt())
+        for (y in ay0..ay1) {
+            val row = y * tw
+            for (x in ax0..ax1) {
+                if (mask[row + x].toInt() != 1) continue
+                val dx = x - cx; val dy = y - cy
+                val dd = dx * dx + dy * dy
+                if (dd < rIn * rIn || dd > rOut * rOut) continue
+                var a = Math.toDegrees(atan2(dy, dx).toDouble()).toInt()
+                if (a < 0) a += 360
+                hist[a % 360] += 1f
+            }
+        }
+        var peak = 0
+        var best = 0f
+        for (i in 0 until 360) {
+            val s = hist[(i + 359) % 360] + hist[i] + hist[(i + 1) % 360]
+            if (s > best) { best = s; peak = i }
+        }
+        peakSum = best
+        return peak
+    }
+
+    private fun feltRing(cx: Float, cy: Float, r: Float): Int {
+        var n = 0
+        for (i in 0 until 32) {
+            val a = i * Math.PI / 16.0
+            val x = (cx + r * cos(a)).toInt()
+            val y = (cy + r * sin(a)).toInt()
+            if (x in 0 until tw && y in 0 until th && mask[y * tw + x].toInt() == 3) n++
+        }
+        return n
+    }
+
+    /** نسبة الانضغاط بالمنظور (1 = منظر من فوق ، أصغر = 3D مايل) */
+    fun foreshortening(Hi: DoubleArray, u: Float, v: Float): Float {
+        val e = 0.01f
+        val a = FloatArray(2); val b = FloatArray(2); val c = FloatArray(2)
+        if (!apply(Hi, u, v, a) || !apply(Hi, u + e, v, b) || !apply(Hi, u, v + e, c)) return 1f
+        val p1 = (b[0] - a[0]) / e; val p2 = (b[1] - a[1]) / e
+        val q1 = (c[0] - a[0]) / e; val q2 = (c[1] - a[1]) / e
+        val pp = p1 * p1 + p2 * p2
+        val qq = q1 * q1 + q2 * q2
+        val pq = p1 * q1 + p2 * q2
+        val tr = pp + qq
+        val det = pp * qq - pq * pq
+        val dsc = sqrt(max(0f, tr * tr / 4f - det))
+        val l1 = tr / 2f + dsc
+        val l2 = max(0f, tr / 2f - dsc)
+        if (l1 <= 0f) return 1f
+        return sqrt(l2 / l1).coerceIn(0f, 1f)
+    }
+
+    private fun hue(r: Int, g: Int, b: Int, mx: Int, ch: Int): Float {
+        val c = ch.toFloat()
+        val h = when (mx) {
+            r -> ((g - b) / c).let { if (it < 0) it + 6f else it }
+            g -> (b - r) / c + 2f
+            else -> (r - g) / c + 4f
+        }
+        return h * 60f
     }
 
     private fun count(xf: Float, yf: Float, v: Int): Int {
@@ -366,16 +603,19 @@ class Analyzer {
         java.util.Arrays.fill(sumB, 0)
         var y = 0
         while (y < th) {
-            val row = (y0 + y) * w + x0
+            val gy = y + y0
             var x = 0
             while (x < tw) {
-                val c = px[row + x]
-                val r = (c shr 16) and 0xff
-                val g = (c shr 8) and 0xff
-                val b = c and 0xff
-                val k = ((r shr 4) shl 8) or ((g shr 4) shl 4) or (b shr 4)
-                bucket[k]++
-                sumR[k] += r; sumG[k] += g; sumB[k] += b
+                val gx = x + x0
+                if (region[gy * w + gx].toInt() == 1) {
+                    val c = px[gy * w + gx]
+                    val r = (c shr 16) and 0xff
+                    val g = (c shr 8) and 0xff
+                    val b = c and 0xff
+                    val k = ((r shr 4) shl 8) or ((g shr 4) shl 4) or (b shr 4)
+                    bucket[k]++
+                    sumR[k] += r; sumG[k] += g; sumB[k] += b
+                }
                 x += 3
             }
             y += 3
@@ -384,9 +624,12 @@ class Analyzer {
         for (i in 1 until 4096) if (bucket[i] > bucket[best]) best = i
         val cnt = bucket[best]
         if (cnt > 0) {
-            feltR = sumR[best] / cnt
-            feltG = sumG[best] / cnt
-            feltB = sumB[best] / cnt
+            val r = sumR[best] / cnt
+            val g = sumG[best] / cnt
+            val b = sumB[best] / cnt
+            val mx = max(r, max(g, b))
+            val mn = min(r, min(g, b))
+            if (mx > mn) feltHue = hue(r, g, b, mx, mx - mn)
         }
     }
 }

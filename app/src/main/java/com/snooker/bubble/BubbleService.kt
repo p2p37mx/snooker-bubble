@@ -6,9 +6,14 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -16,11 +21,13 @@ import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.MediaStore
 import android.util.DisplayMetrics
 import android.view.Display
 import android.view.Gravity
@@ -29,6 +36,8 @@ import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.widget.Toast
+import java.io.File
+import java.io.FileOutputStream
 import kotlin.math.hypot
 
 class BubbleService : Service() {
@@ -41,6 +50,15 @@ class BubbleService : Service() {
         @Volatile
         var running = false
     }
+
+    /** معايرة جاهزة لحجم صورة معيّن */
+    private class Cal(
+        val slot: String,
+        val norm: Array<FloatArray>,
+        val w: Int, val h: Int,
+        val H: DoubleArray, val Hi: DoubleArray,
+        val refX: Float, val refY: Float
+    )
 
     private lateinit var wm: WindowManager
     private val main = Handler(Looper.getMainLooper())
@@ -57,14 +75,21 @@ class BubbleService : Service() {
 
     @Volatile private var scrW = 0
     @Volatile private var scrH = 0
-    @Volatile private var pockets: Array<FloatArray>? = null
+    @Volatile private var calNorm = HashMap<String, Array<FloatArray>>()
     @Volatile private var bubbleRect: IntArray? = null
     @Volatile private var paused = false
     @Volatile private var calibrating = false
 
+    // يستخدم فقط على خيط التحليل
     private val analyzer = Analyzer()
     private var pixels = IntArray(0)
+    private var lastW = 0
+    private var lastH = 0
+    private var lastCal: Cal? = null
     private var lastFrame = 0L
+    private var frameNo = 0
+    private val calCache = HashMap<String, Cal>()
+    private var activeSlot: String? = null
     private val history = ArrayDeque<Analyzer.State>()
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -132,7 +157,7 @@ class BubbleService : Service() {
         val n = Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat)
             .setContentTitle("مساعد السنوكر شغّال")
-            .setContentText("ضغطة مطوّلة على الفقاعة = معايرة الجيوب")
+            .setContentText("مطوّلة = معايرة • ضغطتين = لقطة تشخيص")
             .setContentIntent(openPi)
             .setOngoing(true)
             .addAction(Notification.Action.Builder(null, "إيقاف", stopPi).build())
@@ -153,7 +178,15 @@ class BubbleService : Service() {
         disp.getRealMetrics(m)
         scrW = m.widthPixels
         scrH = m.heightPixels
-        pockets = Prefs.loadPockets(this, scrW > scrH)
+        loadCalibrations()
+    }
+
+    private fun loadCalibrations() {
+        val map = HashMap<String, Array<FloatArray>>()
+        for (s in Prefs.SLOTS) {
+            Prefs.loadPockets(this, scrW > scrH, s)?.let { map[s] = it }
+        }
+        calNorm = map
     }
 
     /** يشتغل على خيط التحليل */
@@ -162,7 +195,7 @@ class BubbleService : Service() {
         val w = scrW
         val h = scrH
         if (w <= 0 || h <= 0) return
-        val scale = 640f / maxOf(w, h)
+        val scale = 1280f / maxOf(w, h)
         val cw = maxOf(2, ((w * scale).toInt() / 2) * 2)
         val ch = maxOf(2, ((h * scale).toInt() / 2) * 2)
         val dpi = resources.displayMetrics.densityDpi
@@ -184,18 +217,73 @@ class BubbleService : Service() {
         }
         try { old?.close() } catch (ignored: Exception) { }
         history.clear()
+        calCache.clear()
+    }
+
+    private fun calFor(slot: String, w: Int, h: Int): Cal? {
+        val norm = calNorm[slot] ?: return null
+        val c = calCache[slot]
+        if (c != null && c.w == w && c.h == h && c.norm === norm) return c
+        val src = Array(4) { floatArrayOf(norm[it][0] * w, norm[it][1] * h) }
+        val H = Analyzer.homography(src, Analyzer.CAL_TABLE) ?: return null
+        val Hi = Analyzer.invert(H) ?: return null
+        val nc = Cal(slot, norm, w, h, H, Hi, src[0][0], src[0][1])
+        calCache[slot] = nc
+        return nc
+    }
+
+    /** إذا عندنا معايرتين، نختار اللي قماشها أخضر أكثر بالصورة الحالية */
+    private fun chooseCal(w: Int, h: Int): Cal? {
+        val cals = Prefs.SLOTS.mapNotNull { calFor(it, w, h) }
+        if (cals.isEmpty()) return null
+        if (cals.size == 1) return cals[0]
+        val cur = activeSlot
+        if (cur != null && frameNo % 6 != 0) {
+            cals.firstOrNull { it.slot == cur }?.let { return it }
+        }
+        var best = cals[0]
+        var bestScore = -1
+        val out = FloatArray(2)
+        for (c in cals) {
+            var score = 0
+            var u = 0.1f
+            while (u < 0.95f) {
+                var v = 0.1f
+                while (v < 1.95f) {
+                    if (Analyzer.apply(c.Hi, u, v, out)) {
+                        val x = out[0].toInt()
+                        val y = out[1].toInt()
+                        if (x in 0 until w && y in 0 until h) {
+                            val p = pixels[y * w + x]
+                            val r = (p shr 16) and 0xff
+                            val g = (p shr 8) and 0xff
+                            val b = p and 0xff
+                            if (g > r + 25 && g > b + 25) score++
+                        }
+                    }
+                    v += 0.2f
+                }
+                u += 0.1f
+            }
+            if (score > bestScore) { bestScore = score; best = c }
+        }
+        if (activeSlot != best.slot) {
+            activeSlot = best.slot
+            history.clear()
+        }
+        return best
     }
 
     private fun onImage(r: ImageReader) {
         val img = try { r.acquireLatestImage() } catch (e: Exception) { null } ?: return
         try {
             val now = SystemClock.uptimeMillis()
-            if (paused || calibrating || now - lastFrame < 170) return
+            if (paused || calibrating || now - lastFrame < 200) return
             lastFrame = now
+            frameNo++
 
             val w = img.width
             val h = img.height
-            // إذا الشاشة اندارت وبعدنا ما حدثنا الحجم
             if ((w > h) != (scrW > scrH)) return
 
             val plane = img.planes[0]
@@ -214,13 +302,15 @@ class BubbleService : Service() {
                     i += ps
                 }
             }
+            lastW = w
+            lastH = h
 
-            val pk = pockets
-            if (pk == null) {
+            val cal = chooseCal(w, h)
+            lastCal = cal
+            if (cal == null) {
                 show(BubbleView.Mode.CALIB, 0f)
                 return
             }
-            val pts = Array(pk.size) { floatArrayOf(pk[it][0] * w, pk[it][1] * h) }
             val sx = w.toFloat() / scrW
             val sy = h.toFloat() / scrH
             val excl = bubbleRect?.let {
@@ -230,7 +320,8 @@ class BubbleService : Service() {
                 )
             }
             val res = analyzer.analyze(
-                pixels, w, h, pts, excl, Prefs.tolerance(this).toFloat()
+                pixels, w, h, cal.H, cal.Hi, cal.refX, cal.refY,
+                excl, Prefs.tolerance(this).toFloat()
             )
 
             history.addLast(res.state)
@@ -255,6 +346,96 @@ class BubbleService : Service() {
         main.post {
             if (!paused && !calibrating) bubble?.set(mode, err)
         }
+    }
+
+    // ---------------- لقطة التشخيص ----------------
+    /** يشتغل على خيط التحليل: يرسم شنو شاف المساعد على آخر صورة ويحفظها بالصور */
+    private fun saveSnapshot() {
+        val w = lastW
+        val h = lastH
+        if (w == 0 || h == 0) {
+            toast("بعد ما وصلت صورة، جرب بعد ثانية")
+            return
+        }
+        try {
+            val argb = IntArray(w * h)
+            for (i in 0 until w * h) argb[i] = pixels[i] or (0xFF shl 24)
+            val bmp = Bitmap.createBitmap(argb, w, h, Bitmap.Config.ARGB_8888).copy(Bitmap.Config.ARGB_8888, true)
+            val cv = Canvas(bmp)
+            val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 3f }
+            val fillP = Paint(Paint.ANTI_ALIAS_FLAG)
+            val dbg = analyzer.debug
+            val cal = lastCal
+            val o = FloatArray(2)
+            val o2 = FloatArray(2)
+
+            if (cal != null) {
+                // حدود الطاولة
+                p.color = Color.YELLOW
+                val corners = arrayOf(floatArrayOf(0f, 0f), floatArrayOf(1f, 0f), floatArrayOf(1f, 2f), floatArrayOf(0f, 2f))
+                for (i in 0 until 4) {
+                    val a = corners[i]; val b = corners[(i + 1) % 4]
+                    if (Analyzer.apply(cal.Hi, a[0], a[1], o) && Analyzer.apply(cal.Hi, b[0], b[1], o2)) {
+                        cv.drawLine(o[0], o[1], o2[0], o2[1], p)
+                    }
+                }
+                fillP.color = 0xFFFF8800.toInt()
+                for (pk in Analyzer.POCKETS) {
+                    if (Analyzer.apply(cal.Hi, pk[0], pk[1], o)) cv.drawCircle(o[0], o[1], 7f, fillP)
+                }
+            }
+            if (dbg.hasCue) {
+                p.color = Color.CYAN
+                cv.drawCircle(dbg.cx, dbg.cy, dbg.rad, p)
+                if (dbg.hasLine) cv.drawLine(dbg.cx, dbg.cy, dbg.ex, dbg.ey, p)
+            }
+            if (dbg.hasObj) {
+                p.color = Color.MAGENTA
+                cv.drawCircle(dbg.ox, dbg.oy, dbg.orad + 2f, p)
+            }
+            if (dbg.hasPath && dbg.hasObj) {
+                p.color = if (dbg.state == Analyzer.State.GOOD) Color.GREEN else Color.RED
+                p.strokeWidth = 4f
+                cv.drawLine(dbg.ox, dbg.oy, dbg.px, dbg.py, p)
+            }
+            // النص
+            val tp = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textSize = 26f }
+            val bgP = Paint().apply { color = 0xCC000000.toInt() }
+            val line1 = "الحالة: ${dbg.reason}" +
+                    (if (dbg.state == Analyzer.State.BAD && dbg.errDeg < 90f) "  (${"%.1f".format(dbg.errDeg)}°)" else "")
+            val line2 = "المنظر: " + when (cal?.slot) {
+                Prefs.SLOT_TOP -> "من فوق"
+                Prefs.SLOT_3D -> "3D"
+                else -> "بدون معايرة"
+            }
+            cv.drawRect(0f, 0f, w.toFloat(), 70f, bgP)
+            cv.drawText(line1, 12f, 30f, tp)
+            cv.drawText(line2, 12f, 62f, tp)
+
+            val name = "snooker_${System.currentTimeMillis()}.png"
+            if (Build.VERSION.SDK_INT >= 29) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                    put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                    put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/SnookerBubble")
+                }
+                val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                    ?: throw IllegalStateException("no uri")
+                contentResolver.openOutputStream(uri)?.use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                toast("📸 انحفظت اللقطة بالصور ← SnookerBubble")
+            } else {
+                val dir = getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: filesDir
+                val f = File(dir, name)
+                FileOutputStream(f).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                toast("📸 انحفظت: ${f.absolutePath}")
+            }
+        } catch (e: Exception) {
+            toast("ما گدرت أحفظ اللقطة")
+        }
+    }
+
+    private fun toast(msg: String) {
+        main.post { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
     }
 
     // ---------------- الفقاعة ----------------
@@ -285,7 +466,7 @@ class BubbleService : Service() {
         }
         bubble = v
         bubbleParams = p
-        v.set(if (pockets == null) BubbleView.Mode.CALIB else BubbleView.Mode.IDLE, 0f)
+        v.set(if (calNorm.isEmpty()) BubbleView.Mode.CALIB else BubbleView.Mode.IDLE, 0f)
         updateRect()
     }
 
@@ -304,14 +485,13 @@ class BubbleService : Service() {
         updateRect()
     }
 
+    private fun idleMode() =
+        if (calNorm.isEmpty()) BubbleView.Mode.CALIB else BubbleView.Mode.IDLE
+
     private fun togglePause() {
         paused = !paused
         bg.post { history.clear() }
-        bubble?.set(
-            if (paused) BubbleView.Mode.PAUSED
-            else if (pockets == null) BubbleView.Mode.CALIB
-            else BubbleView.Mode.IDLE, 0f
-        )
+        bubble?.set(if (paused) BubbleView.Mode.PAUSED else idleMode(), 0f)
         Toast.makeText(this, if (paused) "إيقاف مؤقت" else "رجع يشتغل", Toast.LENGTH_SHORT).show()
     }
 
@@ -322,12 +502,19 @@ class BubbleService : Service() {
         private var ty = 0f
         private var moved = false
         private var longFired = false
+        private var pendingTap = false
         private val slop = ViewConfiguration.get(this@BubbleService).scaledTouchSlop
         private val longRunnable = Runnable {
             if (!moved) {
                 longFired = true
+                pendingTap = false
+                main.removeCallbacks(singleTap)
                 startCalibration()
             }
+        }
+        private val singleTap = Runnable {
+            pendingTap = false
+            togglePause()
         }
 
         override fun onTouch(v: View, e: MotionEvent): Boolean {
@@ -353,7 +540,17 @@ class BubbleService : Service() {
                 }
                 MotionEvent.ACTION_UP -> {
                     main.removeCallbacks(longRunnable)
-                    if (!moved && !longFired) togglePause()
+                    if (!moved && !longFired) {
+                        if (pendingTap) {
+                            // ضغطتين = لقطة تشخيص
+                            pendingTap = false
+                            main.removeCallbacks(singleTap)
+                            bg.post { saveSnapshot() }
+                        } else {
+                            pendingTap = true
+                            main.postDelayed(singleTap, 300)
+                        }
+                    }
                 }
                 MotionEvent.ACTION_CANCEL -> main.removeCallbacks(longRunnable)
             }
@@ -395,11 +592,25 @@ class BubbleService : Service() {
         readScreenSize()
         val landscape = scrW > scrH
         val norm = raw.map { floatArrayOf(it[0] / scrW, it[1] / scrH) }
-        Prefs.savePockets(this, landscape, norm)
-        pockets = norm.toTypedArray()
+
+        // نحدد المنظر: من فوق (بدون منظور) لو 3D
+        val src = Array(4) { floatArrayOf(raw[it][0], raw[it][1]) }
+        val H = Analyzer.homography(src, Analyzer.CAL_TABLE)
+        val Hi = H?.let { Analyzer.invert(it) }
+        if (H == null || Hi == null) {
+            closeCalibration()
+            Toast.makeText(this, "النقاط غلط، عيد المعايرة بالترتيب", Toast.LENGTH_LONG).show()
+            return
+        }
+        val f = analyzer.foreshortening(Hi, 0.5f, 1f)
+        val slot = if (f > 0.75f) Prefs.SLOT_TOP else Prefs.SLOT_3D
+        Prefs.savePockets(this, landscape, slot, norm)
+        loadCalibrations()
+        bg.post { calCache.clear(); activeSlot = null }
         closeCalibration()
         bubble?.set(BubbleView.Mode.IDLE, 0f)
-        Toast.makeText(this, "تمت المعايرة ✓", Toast.LENGTH_SHORT).show()
+        val name = if (slot == Prefs.SLOT_TOP) "المنظر الفوقي" else "منظر 3D"
+        Toast.makeText(this, "تمت معايرة $name ✓", Toast.LENGTH_SHORT).show()
     }
 
     private fun closeCalibration() {
@@ -416,9 +627,7 @@ class BubbleService : Service() {
             if (calib != null) closeCalibration()
             readScreenSize()
             clampBubble()
-            if (!paused) bubble?.set(
-                if (pockets == null) BubbleView.Mode.CALIB else BubbleView.Mode.IDLE, 0f
-            )
+            if (!paused) bubble?.set(idleMode(), 0f)
             bg.post { setupCapture() }
         }, 400)
     }
