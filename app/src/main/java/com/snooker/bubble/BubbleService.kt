@@ -92,6 +92,11 @@ class BubbleService : Service() {
     private var activeSlot: String? = null
     private val history = ArrayDeque<Analyzer.State>()
 
+    // كشف تلقائي للطاولة بالمنظر الفوقي
+    private var autoBox: IntArray? = null
+    private var autoCal: Cal? = null
+    private var autoMiss = 0
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -157,7 +162,7 @@ class BubbleService : Service() {
         val n = Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat)
             .setContentTitle("مساعد السنوكر شغّال")
-            .setContentText("مطوّلة = معايرة • ضغطتين = لقطة تشخيص")
+            .setContentText("ضغطة = إيقاف مؤقت • ضغطتين = لقطة تشخيص")
             .setContentIntent(openPi)
             .setOngoing(true)
             .addAction(Notification.Action.Builder(null, "إيقاف", stopPi).build())
@@ -218,6 +223,8 @@ class BubbleService : Service() {
         try { old?.close() } catch (ignored: Exception) { }
         history.clear()
         calCache.clear()
+        autoBox = null
+        autoCal = null
     }
 
     private fun calFor(slot: String, w: Int, h: Int): Cal? {
@@ -230,6 +237,87 @@ class BubbleService : Service() {
         val nc = Cal(slot, norm, w, h, H, Hi, src[0][0], src[0][1])
         calCache[slot] = nc
         return nc
+    }
+
+    /**
+     * المنظر الفوقي: القماش مستطيل أخضر نسبته ~2:1 ما يلمس حواف الشاشة.
+     * الجيوب = زوايا المستطيل + نص الضلعين الطوال.
+     */
+    private fun detectTopTable(w: Int, h: Int): IntArray? {
+        val rows = IntArray(h)
+        val cols = IntArray(w)
+        var y = 0
+        while (y < h) {
+            val o = y * w
+            var x = 0
+            while (x < w) {
+                val p = pixels[o + x]
+                val r = (p shr 16) and 0xff
+                val g = (p shr 8) and 0xff
+                val b = p and 0xff
+                if (g > r + 40 && g > b + 40) { rows[y]++; cols[x]++ }
+                x += 2
+            }
+            y += 2
+        }
+        var mr = 0; var mc = 0
+        for (v in rows) if (v > mr) mr = v
+        for (v in cols) if (v > mc) mc = v
+        if (mr < 20 || mc < 10) return null
+        var top = -1; var bot = -1; var left = -1; var right = -1
+        for (i in 0 until h) if (rows[i] > mr / 2) { if (top < 0) top = i; bot = i }
+        for (i in 0 until w) if (cols[i] > mc / 2) { if (left < 0) left = i; right = i }
+        if (top < 0 || left < 0) return null
+        if (left <= 3 || top <= 3 || right >= w - 4 || bot >= h - 4) return null
+        val bw = (right - left).toFloat()
+        val bh = (bot - top).toFloat()
+        if (bw < 50 || bh < 50) return null
+        val aspect = if (bw > bh) bw / bh else bh / bw
+        if (aspect < 1.8f || aspect > 2.15f) return null
+        var gN = 0; var tN = 0
+        y = top
+        while (y <= bot) {
+            var x = left
+            while (x <= right) {
+                val p = pixels[y * w + x]
+                val r = (p shr 16) and 0xff
+                val g = (p shr 8) and 0xff
+                val b = p and 0xff
+                if (g > r + 40 && g > b + 40) gN++
+                tN++
+                x += 4
+            }
+            y += 4
+        }
+        if (tN == 0 || gN.toFloat() / tN < 0.88f) return null
+        return intArrayOf(left, top, right, bot)
+    }
+
+    private fun updateAutoTable(w: Int, h: Int) {
+        val b = detectTopTable(w, h)
+        if (b == null) {
+            autoMiss++
+            if (autoMiss >= 3) { autoBox = null; autoCal = null }
+            return
+        }
+        autoMiss = 0
+        val old = autoBox
+        if (old != null && autoCal?.w == w && autoCal?.h == h &&
+            (0 until 4).all { kotlin.math.abs(old[it] - b[it]) <= 3 }
+        ) return
+        val l = b[0].toFloat(); val t = b[1].toFloat(); val r = b[2].toFloat(); val bt = b[3].toFloat()
+        val src = if (r - l >= bt - t) {
+            val mx = (l + r) / 2f
+            arrayOf(floatArrayOf(l, t), floatArrayOf(l, bt), floatArrayOf(mx, t), floatArrayOf(mx, bt))
+        } else {
+            val my = (t + bt) / 2f
+            arrayOf(floatArrayOf(l, t), floatArrayOf(r, t), floatArrayOf(l, my), floatArrayOf(r, my))
+        }
+        val H = Analyzer.homography(src, Analyzer.CAL_TABLE) ?: return
+        val Hi = Analyzer.invert(H) ?: return
+        if (old == null) history.clear()
+        autoBox = b
+        autoCal = Cal("auto", src, w, h, H, Hi, l, t)
     }
 
     /** إذا عندنا معايرتين، نختار اللي قماشها أخضر أكثر بالصورة الحالية */
@@ -305,10 +393,12 @@ class BubbleService : Service() {
             lastW = w
             lastH = h
 
-            val cal = chooseCal(w, h)
+            if (frameNo % 5 == 1 || autoBox == null) updateAutoTable(w, h)
+            val cal = if (autoBox != null) autoCal else chooseCal(w, h)
             lastCal = cal
             if (cal == null) {
-                show(BubbleView.Mode.CALIB, 0f)
+                analyzer.debug.reason = "منظر 3D - حوّل للمنظر الفوقي"
+                show(BubbleView.Mode.VIEW, 0f)
                 return
             }
             val sx = w.toFloat() / scrW
@@ -404,9 +494,10 @@ class BubbleService : Service() {
             val line1 = "الحالة: ${dbg.reason}" +
                     (if (dbg.state == Analyzer.State.BAD && dbg.errDeg < 90f) "  (${"%.1f".format(dbg.errDeg)}°)" else "")
             val line2 = "المنظر: " + when (cal?.slot) {
-                Prefs.SLOT_TOP -> "من فوق"
-                Prefs.SLOT_3D -> "3D"
-                else -> "بدون معايرة"
+                "auto" -> "من فوق (تلقائي)"
+                Prefs.SLOT_TOP -> "من فوق (يدوي)"
+                Prefs.SLOT_3D -> "3D (يدوي)"
+                else -> "3D بدون معايرة"
             }
             cv.drawRect(0f, 0f, w.toFloat(), 70f, bgP)
             cv.drawText(line1, 12f, 30f, tp)
@@ -466,7 +557,7 @@ class BubbleService : Service() {
         }
         bubble = v
         bubbleParams = p
-        v.set(if (calNorm.isEmpty()) BubbleView.Mode.CALIB else BubbleView.Mode.IDLE, 0f)
+        v.set(BubbleView.Mode.IDLE, 0f)
         updateRect()
     }
 
@@ -485,8 +576,7 @@ class BubbleService : Service() {
         updateRect()
     }
 
-    private fun idleMode() =
-        if (calNorm.isEmpty()) BubbleView.Mode.CALIB else BubbleView.Mode.IDLE
+    private fun idleMode() = BubbleView.Mode.IDLE
 
     private fun togglePause() {
         paused = !paused

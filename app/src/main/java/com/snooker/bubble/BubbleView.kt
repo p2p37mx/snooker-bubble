@@ -12,7 +12,7 @@ import kotlin.math.roundToInt
 
 class BubbleView(context: Context) : View(context) {
 
-    enum class Mode { IDLE, GOOD, BAD, CALIB, PAUSED }
+    enum class Mode { IDLE, GOOD, BAD, CALIB, PAUSED, VIEW }
 
     private var mode = Mode.IDLE
     private var err = 0f
@@ -48,6 +48,7 @@ class BubbleView(context: Context) : View(context) {
             Mode.CALIB -> 0xFFF59E0B.toInt()
             Mode.PAUSED -> 0xFF6B7280.toInt()
             Mode.IDLE -> 0xFF374151.toInt()
+            Mode.VIEW -> 0xFF2563EB.toInt()
         }
 
         // توهج خارجي
@@ -66,6 +67,7 @@ class BubbleView(context: Context) : View(context) {
             Mode.CALIB -> "!"
             Mode.PAUSED -> "II"
             Mode.IDLE -> "•"
+            Mode.VIEW -> "⬒"
         }
         val showDeg = mode == Mode.BAD && err < 90f
         text.textSize = r * (if (showDeg) 0.6f else 0.8f)
