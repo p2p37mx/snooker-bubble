@@ -94,7 +94,7 @@ object Prefs {
         (sp(ctx).getStringSet("last", emptySet()) ?: emptySet())
             .mapNotNull { ComponentName.unflattenFromString(it) }.toSet()
 
-    fun whitelist(ctx: Context): Set<String> =
+    fun whitelist(ctx: Context): MutableSet<String> =
         HashSet(sp(ctx).getStringSet("keep", emptySet()) ?: emptySet())
 
     fun setKeep(ctx: Context, cn: ComponentName, keep: Boolean) {
