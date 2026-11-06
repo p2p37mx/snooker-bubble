@@ -1,0 +1,42 @@
+name: Build AccessBubble APK
+
+on:
+  push:
+    branches: [access-bubble]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Collect APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk AccessBubble.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AccessBubble-apk
+          path: AccessBubble.apk
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: access-${{ github.run_number }}
+          name: فقاعة الوصول ${{ github.run_number }}
+          target_commitish: access-bubble
+          files: AccessBubble.apk
