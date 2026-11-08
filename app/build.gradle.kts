@@ -11,13 +11,25 @@ android {
         applicationId = "com.snooker.bubble"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
+        versionCode = 2
         versionName = "1.0"
+    }
+
+    signingConfigs {
+        create("release") {
+            // المفتاح الرسمي — محفوظ بـ GitHub Secrets (SIGNING_KEY + SIGNING_PASSWORD) ومو موجود بالكود
+            storeFile = file(System.getenv("SIGNING_KEY_FILE") ?: "/nonexistent")
+            storeType = "pkcs12"
+            storePassword = System.getenv("SIGNING_PASSWORD")
+            keyAlias = "p2p37mx"
+            keyPassword = System.getenv("SIGNING_PASSWORD")
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 
